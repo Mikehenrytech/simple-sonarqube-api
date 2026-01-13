@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-sonarqube-api"
+version = "0.1.0"
+description = "Simple Python client for SonarQube Web API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "M.E. (Mikehenrytech)" }]
+dependencies = [
+  "requests>=2.32"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "responses>=0.25",
+  "ruff>=0.6",
+  "mypy>=1.11"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
