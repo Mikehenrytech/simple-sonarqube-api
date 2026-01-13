@@ -6,8 +6,14 @@ Sonarqube api python module
 
 ## Example
 
+Install module
+```bash
+$ pip install simple-sonarqube-api
+```
+
+Code example
 ```python
-from simple_sonarqube_api import SonarQubeClient
+from simple_sonarqube_api.client import SonarQubeClient
 
 client = SonarQubeClient(
     base_url="https://sonar.midominio",
