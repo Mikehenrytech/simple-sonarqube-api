@@ -592,3 +592,77 @@ class SonarQubeClient:
                 component_key, from_line, to_line, e
             )
             return None
+
+# -------------------------
+    # Projects
+    # -------------------------
+    def iter_projects(
+        self,
+        *,
+        qualifiers: str = "TRK",
+        include_visibility: bool = False,
+        additional_params: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Itera todos los proyectos (por defecto qualifier TRK) usando /api/components/search.
+
+        Args:
+            qualifiers: normalmente "TRK" para projects.
+            include_visibility: si True, pide a la API que incluya 'visibility' (si tu versión lo soporta).
+            additional_params: filtros extra del endpoint (p.ej. 'q' para búsqueda, etc.)
+        """
+        params: Dict[str, Any] = {"qualifiers": qualifiers}
+
+        # Algunas versiones soportan "visibility" en el payload sin param;
+        # otras aceptan "additionalFields" (depende de versión). Lo hacemos opt-in y no rompemos.
+        if include_visibility:
+            # "additionalFields" es habitual en varios endpoints; si tu instancia no lo soporta,
+            # simplemente ignóralo (o captura el error si te interesa endurecer comportamiento).
+            params["additionalFields"] = "visibility"
+
+        if additional_params:
+            # Evita que el caller pise qualifiers sin querer.
+            extra = dict(additional_params)
+            extra.pop("qualifiers", None)
+            params.update(extra)
+
+        yield from self._iter_paginated(
+            "/api/components/search",
+            items_key="components",
+            base_params=params,
+        )
+
+    def list_projects(
+        self,
+        *,
+        qualifiers: str = "TRK",
+        include_visibility: bool = False,
+        additional_params: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Devuelve una lista con todos los proyectos.
+
+        Seguridad:
+          - `limit` opcional para evitar consumir memoria/tiempo en instancias grandes.
+
+        Args:
+            qualifiers: normalmente "TRK".
+            include_visibility: ver iter_projects.
+            additional_params: ver iter_projects.
+            limit: si se indica, corta la lista a ese máximo de proyectos.
+        """
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit debe ser un entero > 0.")
+
+        projects: List[Dict[str, Any]] = []
+        for p in self.iter_projects(
+            qualifiers=qualifiers,
+            include_visibility=include_visibility,
+            additional_params=additional_params,
+        ):
+            projects.append(p)
+            if limit is not None and len(projects) >= limit:
+                break
+        return projects
