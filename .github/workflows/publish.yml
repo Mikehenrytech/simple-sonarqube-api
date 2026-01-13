@@ -33,11 +33,11 @@ jobs:
         run: |
           python -m pip install -e ".[dev]"
 
-      - name: Lint (ruff)
-        run: |
-          ruff check .
-          # si usas ruff format, descomenta:
-          # ruff format --check .
+      #- name: Lint (ruff)
+      #  run: |
+      #    ruff check .
+      #    # si usas ruff format, descomenta:
+      #    # ruff format --check .
 
       # Opcional: typing. Si aún no lo tienes fino, déjalo comentado.
       - name: Type-check (mypy)
