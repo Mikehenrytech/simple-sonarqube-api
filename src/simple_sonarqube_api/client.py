@@ -31,6 +31,24 @@ class ClientConfig:
     backoff_factor: float = 0.5
     user_agent: str = "simple-sonarqube-api/0.1"
 
+@dataclass(frozen=True)
+class Project:
+    """
+    Representación normalizada de un proyecto SonarQube (component qualifier TRK).
+
+    Nota: los campos disponibles pueden variar por versión/configuración de SonarQube y permisos.
+    """
+    key: str
+    name: str
+
+    # Frecuentes, pero no siempre presentes:
+    qualifier: str = "TRK"
+    visibility: Optional[str] = None          # "public" | "private" (si tu instancia lo expone)
+    last_analysis_date: Optional[str] = None  # ISO 8601 string, p.ej. "2025-01-13T10:22:33+0100"
+    revision: Optional[str] = None            # hash/sha o revisión, si aparece
+    project: Optional[str] = None             # a veces "project" o "projectKey" en otros endpoints
+    raw: Optional[Dict[str, Any]] = None      # opcional: payload original (útil para debug/auditoría)
+
 
 class SonarQubeClient:
     """
@@ -666,3 +684,121 @@ class SonarQubeClient:
             if limit is not None and len(projects) >= limit:
                 break
         return projects
+
+ # -------------------------
+    # Projects (normalización)
+    # -------------------------
+    @staticmethod
+    def normalize_project(component: Dict[str, Any], *, keep_raw: bool = False) -> Project:
+        """
+        Normaliza un 'component' devuelto por /api/components/search en un Project.
+
+        Seguridad/robustez:
+          - Validación estricta de key/name (imprescindibles).
+          - Tolerancia a campos opcionales y variaciones por versión.
+          - keep_raw permite conservar el dict original si lo necesitas (audit/debug).
+        """
+        if not isinstance(component, dict):
+            raise TypeError("component debe ser un dict (payload de SonarQube).")
+
+        key = component.get("key")
+        name = component.get("name")
+
+        if not key or not isinstance(key, str) or not key.strip():
+            raise ValueError("Proyecto inválido: falta 'key' o no es válido.")
+        if not name or not isinstance(name, str) or not name.strip():
+            raise ValueError("Proyecto inválido: falta 'name' o no es válido.")
+
+        qualifier = component.get("qualifier") or "TRK"
+
+        # Campos opcionales comunes (depende de versión/permisos)
+        visibility = component.get("visibility")
+        if visibility is not None and not isinstance(visibility, str):
+            visibility = str(visibility)
+
+        last_analysis_date = component.get("lastAnalysisDate")
+        if last_analysis_date is not None and not isinstance(last_analysis_date, str):
+            last_analysis_date = str(last_analysis_date)
+
+        revision = component.get("revision")
+        if revision is not None and not isinstance(revision, str):
+            revision = str(revision)
+
+        # Algunas APIs/variantes pueden traer "project" además del key; lo guardamos si existe
+        project_field = component.get("project")
+        if project_field is not None and not isinstance(project_field, str):
+            project_field = str(project_field)
+
+        return Project(
+            key=key.strip(),
+            name=name.strip(),
+            qualifier=str(qualifier) if qualifier is not None else "TRK",
+            visibility=visibility,
+            last_analysis_date=last_analysis_date,
+            revision=revision,
+            project=project_field,
+            raw=component if keep_raw else None,
+        )
+
+    def iter_projects_normalized(
+        self,
+        *,
+        qualifiers: str = "TRK",
+        include_visibility: bool = False,
+        additional_params: Optional[Dict[str, Any]] = None,
+        keep_raw: bool = False,
+        strict: bool = False,
+    ) -> Iterator[Project]:
+        """
+        Itera proyectos normalizados.
+
+        Args:
+            qualifiers: normalmente "TRK"
+            include_visibility: si True pide visibility (si tu versión lo soporta)
+            additional_params: params extra para /api/components/search
+            keep_raw: guarda el dict original dentro de Project.raw
+            strict:
+                - True: cualquier proyecto inválido lanza excepción (fail-fast).
+                - False: se ignoran proyectos inválidos y se loguea warning.
+        """
+        for comp in self.iter_projects(
+            qualifiers=qualifiers,
+            include_visibility=include_visibility,
+            additional_params=additional_params,
+        ):
+            try:
+                yield self.normalize_project(comp, keep_raw=keep_raw)
+            except (TypeError, ValueError) as e:
+                if strict:
+                    raise
+                self.log.warning("Proyecto omitido por payload inválido: %s", e)
+
+    def list_projects_normalized(
+        self,
+        *,
+        qualifiers: str = "TRK",
+        include_visibility: bool = False,
+        additional_params: Optional[Dict[str, Any]] = None,
+        keep_raw: bool = False,
+        strict: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[Project]:
+        """
+        Devuelve todos los proyectos normalizados en una lista (con límite opcional).
+        """
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit debe ser un entero > 0.")
+
+        out: List[Project] = []
+        for p in self.iter_projects_normalized(
+            qualifiers=qualifiers,
+            include_visibility=include_visibility,
+            additional_params=additional_params,
+            keep_raw=keep_raw,
+            strict=strict,
+        ):
+            out.append(p)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
