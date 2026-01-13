@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Simple Python client for SonarQube Web API"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "M.E. (Mikehenrytech)" }]
 dependencies = [
   "requests>=2.32"
