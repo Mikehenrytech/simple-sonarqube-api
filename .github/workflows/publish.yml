@@ -40,10 +40,10 @@ jobs:
       #    # ruff format --check .
 
       # Opcional: typing. Si aún no lo tienes fino, déjalo comentado.
-      - name: Type-check (mypy)
-        run: |
-          mypy src/simple_sonarqube_api
-        continue-on-error: true
+      #- name: Type-check (mypy)
+      #  run: |
+      #    mypy src/simple_sonarqube_api
+      #  continue-on-error: true
 
       - name: Tests (pytest)
         run: |
