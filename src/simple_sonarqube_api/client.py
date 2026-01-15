@@ -320,36 +320,44 @@ class SonarQubeClient:
             project_key: str,
             *,
             resolved: bool = False,
+            line: Optional[int] = None,
             additional_params: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Itera issues de tipo VULNERABILITY para un proyecto concreto.
 
-        Usa /api/issues/search con:
-          - types=VULNERABILITY
-          - projectKeys=<project_key>
-          - resolved=true/false (por defecto False)
+        Garantía: siempre filtra por el project_key proporcionado (projectKeys=<project_key>).
 
         Args:
             project_key: key del proyecto (TRK), p.ej. "my_project"
             resolved: si incluir resueltas (True) o solo no resueltas (False)
-            additional_params: filtros adicionales del endpoint (p.ej. severities, statuses, rules, createdAfter...)
+            line: opcional; si se usa, requiere component_keys (fichero) en additional_params via 'componentKeys' o 'component_keys'
+            additional_params: filtros extra de /api/issues/search (p.ej. severities, statuses, rules, branch, createdAfter...)
 
         Yields:
-            dict payload de cada issue (tal cual lo devuelve SonarQube).
+            dict de issue (payload SonarQube).
         """
         if not project_key or not project_key.strip():
             raise ValueError("project_key no puede estar vacío.")
 
-        params: Dict[str, Any] = {"projectKeys": project_key.strip()}
-        if additional_params:
-            params.update(additional_params)
+        # Copia defensiva
+        extra: Dict[str, Any] = dict(additional_params or {})
 
-        # Reutiliza el método existente: evita duplicar lógica
-        yield from self.iter_security_issues(
+        # Evitamos que el caller pueda romper el contrato y traer "todo"
+        # (si quieres permitir múltiples projects, crea otro método distinto)
+        extra.pop("projectKeys", None)
+        extra.pop("project_keys", None)
+
+        # Si el caller usa nombre pythonico para component, lo normalizamos
+        if "component_keys" in extra and "componentKeys" not in extra:
+            extra["componentKeys"] = extra.pop("component_keys")
+
+        yield from self.iter_issues(
             types=("VULNERABILITY",),
+            project_keys=project_key.strip(),
             resolved=resolved,
-            additional_params=params,
+            line=line,
+            additional_params=extra,
         )
 
     # -------------------------
