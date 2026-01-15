@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union, Tuple
 
 import requests
 
@@ -31,34 +31,20 @@ class ClientConfig:
     backoff_factor: float = 0.5
     user_agent: str = "simple-sonarqube-api/0.1"
 
+
 @dataclass(frozen=True)
 class Project:
-    """
-    Representación normalizada de un proyecto SonarQube (component qualifier TRK).
-
-    Nota: los campos disponibles pueden variar por versión/configuración de SonarQube y permisos.
-    """
     key: str
     name: str
-
-    # Frecuentes, pero no siempre presentes:
     qualifier: str = "TRK"
-    visibility: Optional[str] = None          # "public" | "private" (si tu instancia lo expone)
-    last_analysis_date: Optional[str] = None  # ISO 8601 string, p.ej. "2025-01-13T10:22:33+0100"
-    revision: Optional[str] = None            # hash/sha o revisión, si aparece
-    project: Optional[str] = None             # a veces "project" o "projectKey" en otros endpoints
-    raw: Optional[Dict[str, Any]] = None      # opcional: payload original (útil para debug/auditoría)
+    visibility: Optional[str] = None
+    last_analysis_date: Optional[str] = None
+    revision: Optional[str] = None
+    project: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
 
 
 class SonarQubeClient:
-    """
-    Cliente minimalista para SonarQube Web API.
-
-    - Auth: Basic auth con token como username y password vacío (patrón oficial).
-    - Paginación: generadores iter_* (no acumulan en memoria).
-    - Robustez: timeout, retries con backoff, logging, errores tipados.
-    """
-
     def __init__(
         self,
         base_url: str,
@@ -78,9 +64,7 @@ class SonarQubeClient:
             raise ValueError("base_url no puede estar vacío.")
         if not token or not token.strip():
             raise ValueError("token no puede estar vacío.")
-
         if page_size <= 0 or page_size > 500:
-            # SonarQube suele aceptar hasta 500; si tu instancia soporta más, lo harás configurable después.
             raise ValueError("page_size debe estar entre 1 y 500.")
 
         self.cfg = ClientConfig(
@@ -97,25 +81,33 @@ class SonarQubeClient:
         self.log = logger or logging.getLogger(__name__)
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": self.cfg.user_agent})
-
-        # Auth: (username=token, password="")
         self._auth = (self.cfg.token, "")
 
     # -------------------------
-    # Infra
+    # Infra (IO mínimo)
     # -------------------------
     def _sleep_if_needed(self) -> None:
         if self.cfg.delay_seconds > 0:
             time.sleep(self.cfg.delay_seconds)
 
-    def _request(
+    def _build_url(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{self.cfg.base_url}{path}"
+
+    def _http_request(
         self,
         method: str,
         path: str,
         *,
         params: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        url = f"{self.cfg.base_url}{path}"
+    ) -> requests.Response:
+        """
+        ÚNICA responsabilidad: hacer HTTP y devolver Response.
+        - Maneja retries/backoff en errores de red y algunos HTTP.
+        - NO parsea JSON, NO interpreta payload.
+        """
+        url = self._build_url(path)
         params = params or {}
 
         last_exc: Optional[Exception] = None
@@ -128,43 +120,99 @@ class SonarQubeClient:
                     params=params,
                     timeout=self.cfg.timeout,
                 )
-
-                # Manejo explícito de auth
-                if resp.status_code in (401, 403):
-                    raise SonarQubeAuthError(
-                        f"Auth error {resp.status_code} en {path}. Revisa token/permisos."
-                    )
-
-                resp.raise_for_status()
-
-                try:
-                    data = resp.json()
-                except ValueError as e:
-                    raise SonarQubeRequestError(
-                        f"Respuesta no-JSON en {path} (HTTP {resp.status_code})."
-                    ) from e
-
-                return data
+                return resp
 
             except (requests.Timeout, requests.ConnectionError) as e:
                 last_exc = e
-                self.log.warning("Fallo de red/timeout (%s) intento %d/%d", path, attempt, self.cfg.max_retries)
-            except requests.HTTPError as e:
-                # Errores HTTP (no auth) -> no siempre tiene sentido reintentar, pero 429/5xx sí.
-                last_exc = e
-                status = getattr(e.response, "status_code", None)
-                if status in (429, 500, 502, 503, 504):
-                    self.log.warning("HTTP %s en %s intento %d/%d", status, path, attempt, self.cfg.max_retries)
-                else:
-                    raise SonarQubeRequestError(f"HTTP error en {path}: {e}") from e
+                self.log.warning(
+                    "Fallo de red/timeout %s intento %d/%d",
+                    path, attempt, self.cfg.max_retries
+                )
 
-            # backoff
             if attempt < self.cfg.max_retries:
                 backoff = self.cfg.backoff_factor * (2 ** (attempt - 1))
                 time.sleep(backoff)
 
         raise SonarQubeRequestError(f"No se pudo completar la petición a {path}.") from last_exc
 
+    # -------------------------
+    # Infra (tratamiento respuesta)
+    # -------------------------
+    @staticmethod
+    def _raise_for_auth(resp: requests.Response, *, path: str) -> None:
+        if resp.status_code in (401, 403):
+            raise SonarQubeAuthError(
+                f"Auth error {resp.status_code} en {path}. Revisa token/permisos."
+            )
+
+    @staticmethod
+    def _raise_for_http(resp: requests.Response, *, path: str) -> None:
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            raise SonarQubeRequestError(f"HTTP error en {path}: {e}") from e
+
+    @classmethod
+    def _parse_json(cls, resp: requests.Response, *, path: str) -> Dict[str, Any]:
+        """
+        Rutina testeable si simulas un Response (o la testeas indirectamente).
+        """
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise SonarQubeRequestError(
+                f"Respuesta no-JSON en {path} (HTTP {resp.status_code})."
+            ) from e
+        if not isinstance(data, dict):
+            raise SonarQubeRequestError(f"JSON inesperado (no dict) en {path}.")
+        return data
+
+    def _handle_response_json(self, resp: requests.Response, *, path: str) -> Dict[str, Any]:
+        """
+        Combina validación de status + parseo JSON.
+        Esto es lo que mockearías si quisieras tests más “alto nivel”.
+        """
+        self._raise_for_auth(resp, path=path)
+        # Si quieres reintentos en 429/5xx, lo ideal es moverlo a _http_request con loop de status.
+        self._raise_for_http(resp, path=path)
+        return self._parse_json(resp, path=path)
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Método puente: hace HTTP + trata respuesta, y devuelve dict JSON.
+        """
+        resp = self._http_request(method, path, params=params)
+        return self._handle_response_json(resp, path=path)
+
+    # -------------------------
+    # Extractores puros (unit-test friendly)
+    # -------------------------
+    @staticmethod
+    def _extract_bool(data: Dict[str, Any], key: str, *, default: bool = False) -> bool:
+        v = data.get(key, default)
+        return bool(v)
+
+    @staticmethod
+    def _extract_list_of_dicts(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+        raw = data.get(key) or []
+        if not isinstance(raw, list):
+            raise SonarQubeRequestError(f"Campo '{key}' no es lista.")
+        out: List[Dict[str, Any]] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise SonarQubeRequestError(f"Elemento {i} de '{key}' no es dict.")
+            out.append(item)
+        return out
+
+    # -------------------------
+    # Paginación
+    # -------------------------
     def _iter_paginated(
         self,
         path: str,
@@ -174,12 +222,6 @@ class SonarQubeClient:
         page_param: str = "p",
         page_size_param: str = "ps",
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Itera resultados paginados estilo SonarQube:
-        - p: página (1..n)
-        - ps: page size
-        - items en data[items_key]
-        """
         params = dict(base_params or {})
         page = 1
 
@@ -187,8 +229,8 @@ class SonarQubeClient:
             params[page_param] = page
             params[page_size_param] = self.cfg.page_size
 
-            data = self._request("GET", path, params=params)
-            items = data.get(items_key) or []
+            data = self._request_json("GET", path, params=params)
+            items = self._extract_list_of_dicts(data, items_key)
             if not items:
                 return
 
@@ -202,8 +244,8 @@ class SonarQubeClient:
     # Auth
     # -------------------------
     def is_authenticated(self) -> bool:
-        data = self._request("GET", "/api/authentication/validate")
-        return bool(data.get("valid", False))
+        data = self._request_json("GET", "/api/authentication/validate")
+        return self._extract_bool(data, "valid", default=False)
 
     # -------------------------
     # Issues
@@ -218,38 +260,24 @@ class SonarQubeClient:
         line: Optional[int] = None,
         additional_params: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Itera issues /api/issues/search.
-
-        Nota SonarQube:
-        - projectKeys y componentKeys son distintos; usa el correcto para tu caso.
-        - resolved suele aceptarse como "true"/"false" string; aquí lo normalizamos.
-        """
         params: Dict[str, Any] = {}
         if additional_params:
             params.update(additional_params)
 
         if types:
-            if isinstance(types, str):
-                params["types"] = types
-            else:
-                params["types"] = ",".join(types)
+            params["types"] = types if isinstance(types, str) else ",".join(types)
 
         if project_keys:
             params["projectKeys"] = project_keys if isinstance(project_keys, str) else ",".join(project_keys)
 
+        component_list: List[str] = []
         if component_keys:
-            # Normalizamos para poder validar bien el caso line
             if isinstance(component_keys, str):
-                component_keys_str = component_keys
                 component_list = [c.strip() for c in component_keys.split(",") if c.strip()]
+                params["componentKeys"] = ",".join(component_list)
             else:
                 component_list = [c.strip() for c in component_keys if c and c.strip()]
-                component_keys_str = ",".join(component_list)
-
-            params["componentKeys"] = component_keys_str
-        else:
-            component_list = []
+                params["componentKeys"] = ",".join(component_list)
 
         if resolved is not None:
             params["resolved"] = "true" if resolved else "false"
@@ -258,11 +286,9 @@ class SonarQubeClient:
             if line <= 0:
                 raise ValueError("line debe ser un entero >= 1.")
             if not component_list:
-                raise ValueError("Para filtrar por line es obligatorio indicar component_keys (file key).")
+                raise ValueError("Para filtrar por line es obligatorio indicar component_keys.")
             if len(component_list) != 1:
-                raise ValueError(
-                    "Para filtrar por line debes indicar exactamente un component_key (un único fichero)."
-                )
+                raise ValueError("Para filtrar por line debes indicar exactamente un component_key.")
             params["line"] = int(line)
 
         yield from self._iter_paginated("/api/issues/search", items_key="issues", base_params=params)
@@ -275,40 +301,55 @@ class SonarQubeClient:
         line: Optional[int] = None,
         **filters: Any,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Atajo para issues de seguridad (por defecto Vulnerability sin resolver).
-        Admite `line` (requiere pasar component_keys vía filters, p.ej. componentKeys / component_keys).
-
-        Ejemplo:
-            client.iter_security_issues(
-                types=("VULNERABILITY",),
-                resolved=False,
-                line=123,
-                componentKeys="my_project:/src/Foo.java"
-            )
-        """
-        # Permitimos al usuario pasar componentKeys vía filters (tal cual API),
-        # o component_keys vía nombre Pythonico si quieres estandarizarlo.
         additional_params = dict(filters)
 
-        # Si el usuario usa "component_keys" estilo Python, lo convertimos a "componentKeys"
         if "component_keys" in additional_params and "componentKeys" not in additional_params:
-            ck = additional_params.pop("component_keys")
-            additional_params["componentKeys"] = ck  # soporta str o lista; iter_issues normaliza
-
-        # Igual para project_keys si lo pasara así
+            additional_params["componentKeys"] = additional_params.pop("component_keys")
         if "project_keys" in additional_params and "projectKeys" not in additional_params:
-            pk = additional_params.pop("project_keys")
-            additional_params["projectKeys"] = pk
+            additional_params["projectKeys"] = additional_params.pop("project_keys")
 
-        # Ahora llamamos a iter_issues usando los parámetros estructurados
         yield from self.iter_issues(
             types=types,
             resolved=resolved,
             line=line,
-            # Ojo: iter_issues espera component_keys / project_keys como args formales,
-            # pero como aquí estamos pasando filtros "raw" de API, lo metemos en additional_params.
             additional_params=additional_params,
+        )
+
+    def iter_project_vulnerabilities(
+            self,
+            project_key: str,
+            *,
+            resolved: bool = False,
+            additional_params: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Itera issues de tipo VULNERABILITY para un proyecto concreto.
+
+        Usa /api/issues/search con:
+          - types=VULNERABILITY
+          - projectKeys=<project_key>
+          - resolved=true/false (por defecto False)
+
+        Args:
+            project_key: key del proyecto (TRK), p.ej. "my_project"
+            resolved: si incluir resueltas (True) o solo no resueltas (False)
+            additional_params: filtros adicionales del endpoint (p.ej. severities, statuses, rules, createdAfter...)
+
+        Yields:
+            dict payload de cada issue (tal cual lo devuelve SonarQube).
+        """
+        if not project_key or not project_key.strip():
+            raise ValueError("project_key no puede estar vacío.")
+
+        params: Dict[str, Any] = {"projectKeys": project_key.strip()}
+        if additional_params:
+            params.update(additional_params)
+
+        # Reutiliza el método existente: evita duplicar lógica
+        yield from self.iter_security_issues(
+            types=("VULNERABILITY",),
+            resolved=resolved,
+            additional_params=params,
         )
 
     # -------------------------
@@ -330,289 +371,7 @@ class SonarQubeClient:
         yield from self._iter_paginated("/api/hotspots/search", items_key="hotspots", base_params=params)
 
     # -------------------------
-    # Projects
-    # -------------------------
-    def iter_projects(self) -> Iterator[Dict[str, Any]]:
-        params = {"qualifiers": "TRK"}
-        yield from self._iter_paginated("/api/components/search", items_key="components", base_params=params)
-
-    # -------------------------
-    # Settings / exclusions
-    # -------------------------
-    def get_exclusions(self, project_key: str) -> str:
-        if not project_key or not project_key.strip():
-            raise ValueError("project_key no puede estar vacío.")
-
-        data = self._request(
-            "GET",
-            "/api/settings/values",
-            params={"component": project_key.strip(), "keys": "sonar.exclusions"},
-        )
-
-        settings = data.get("settings") or []
-        for s in settings:
-            if s.get("key") == "sonar.exclusions":
-                return s.get("value") or ""
-        return ""
-
-    # -------------------------
-    # Normalización (opcional)
-    # -------------------------
-    @staticmethod
-    def normalize_issue(issue: Dict[str, Any]) -> Dict[str, Any]:
-        tags = issue.get("tags") or []
-        owasp = next((t for t in tags if "owasp" in t.lower()), "")
-
-        project = issue.get("project", "") or ""
-        project_short = project
-        if ":" in project:
-            parts = project.split(":", 1)
-            if len(parts) == 2 and parts[1]:
-                project_short = parts[1]
-
-        text_range = issue.get("textRange") or {}
-        start_line = text_range.get("startLine")
-        end_line = text_range.get("endLine")
-
-        return {
-            "project": project,
-            "project_short": project_short,
-            "type": issue.get("type", ""),
-            "severity": issue.get("severity", ""),
-            "owasp": owasp,
-            "rule": issue.get("rule", ""),
-            "status": issue.get("status", ""),
-            "creationDate": issue.get("creationDate", ""),
-            "updateDate": issue.get("updateDate", ""),
-            "effort": issue.get("effort", ""),
-            "debt": issue.get("debt", ""),
-            "quickFixAvailable": issue.get("quickFixAvailable", False),
-            "component": issue.get("component", ""),
-            "message": issue.get("message", ""),
-            "key": issue.get("key", ""),
-            # --- Localización en código ---
-            "line": issue.get("line", ""),
-            "startLine": start_line,
-            "endLine": end_line,
-            "hasLocation": start_line is not None,
-        }
-
-    @staticmethod
-    def normalize_hotspot(hotspot: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "project": hotspot.get("project", ""),
-            "vulnerabilityProbability": hotspot.get("vulnerabilityProbability", ""),
-            "status": hotspot.get("status", ""),
-            "creationDate": hotspot.get("creationDate", ""),
-            "updateDate": hotspot.get("updateDate", ""),
-            "author": hotspot.get("author", ""),
-            "message": hotspot.get("message", ""),
-        }
-
-    # -------------------------
-    # Evidence / Source code
-    # -------------------------
-    def get_issue_code_evidence(
-            self,
-            issue: Dict[str, Any],
-            *,
-            context_lines: int = 10,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Obtiene el código fuente asociado a una issue usando /api/sources/show.
-
-        Mapeo de parámetros (según tu requisito):
-          - endpoint param "key"  <- issue["component"]
-          - endpoint param "from" <- issue["startLine"]
-          - endpoint param "to"   <- issue["endLine"]
-
-        Args:
-            issue: diccionario de issue (idealmente normalizado) que incluya:
-                  component, startLine, endLine, hasLocation
-            context_lines: líneas extra antes/después del rango.
-
-        Returns:
-            {
-              "component": "<component key>",
-              "from": <int>,
-              "to": <int>,
-              "snippet": "  108 | ...\n"
-            }
-            o None si no hay localización o no se pudo obtener el código.
-        """
-        if not isinstance(issue, dict):
-            raise TypeError("issue debe ser un dict con los campos de la issue.")
-
-        component_key: str = issue.get("component")
-        start_line: int = issue.get("startLine")
-        end_line: int = issue.get("endLine")
-        has_location: bool = issue.get("hasLocation", start_line is not None)
-
-        if not has_location or not has_location:
-            return None
-
-        if not component_key or not isinstance(component_key, str):
-            return None
-
-        if start_line is None or end_line is None:
-            return None
-
-        try:
-            start_line_int = int(start_line)
-            end_line_int = int(end_line)
-        except (TypeError, ValueError):
-            return None
-
-        if start_line_int <= 0 or end_line_int <= 0:
-            return None
-        if end_line_int < start_line_int:
-            # Normalización defensiva
-            start_line_int, end_line_int = end_line_int, start_line_int
-
-        if context_lines < 0:
-            raise ValueError("context_lines debe ser >= 0.")
-
-        from_line = max(1, start_line_int - int(context_lines))
-        to_line = end_line_int + int(context_lines)
-
-        # Llamada al endpoint oficial
-        data = self._request(
-            "GET",
-            "/api/sources/show",
-            params={
-                "key": component_key,
-                "from": from_line,
-                "to": to_line,
-            },
-        )
-
-        # Llamada al endpoint oficial
-        data_raw = self.get_component_raw_source(component_key, from_line=from_line, to_line=to_line)
-        print(f"data_raw: {data_raw}")
-
-        sources = data.get("sources") or []
-        if not sources:
-            return None
-        print(f"sources: {sources}")
-        # Formato típico: {"sources":[{"line":108,"code":"..."}, ...]}
-        snippet_lines: List[str] = []
-        for row in sources:
-            ln = row[0]
-            code = row[1]
-
-            #  TODO revisar desde aquí
-
-            try:
-                ln_int = int(ln)
-            except (TypeError, ValueError):
-                # Si viene raro, lo omitimos
-                continue
-            snippet_lines.append(f"{ln_int:>5} | {code}")
-
-        if not snippet_lines:
-            return None
-
-        return {
-            "component": component_key,
-            "from": from_line,
-            "to": to_line,
-            "snippet": "\n".join(snippet_lines),
-            "raw": data_raw
-        }
-
-    # -------------------------
-    # Raw source (optionally ranged)
-    # -------------------------
-    def get_component_raw_source(
-            self,
-            component_key: str,
-            *,
-            from_line: Optional[int] = None,
-            to_line: Optional[int] = None,
-    ) -> Optional[str]:
-        """
-        Obtiene el código fuente de un componente usando /api/sources/raw
-        y, si se indican, recorta localmente por rango de líneas.
-
-        Args:
-            component_key: clave del componente, p.ej.
-                           "dvja:src/main/java/com/appsecco/dvja/services/UserService.java"
-            from_line: línea inicial (1-based). Opcional.
-            to_line: línea final (1-based). Opcional.
-
-        Returns:
-            El contenido del archivo (completo o recortado) como string,
-            o None si no hay acceso o hay error.
-        """
-        if not component_key or not component_key.strip():
-            raise ValueError("component_key no puede estar vacío.")
-
-        if from_line is not None and from_line <= 0:
-            raise ValueError("from_line debe ser un entero >= 1.")
-        if to_line is not None and to_line <= 0:
-            raise ValueError("to_line debe ser un entero >= 1.")
-        if from_line is not None and to_line is not None and to_line < from_line:
-            raise ValueError("to_line no puede ser menor que from_line.")
-
-        url = f"{self.cfg.base_url}/api/sources/raw"
-
-        # Pedimos siempre el raw completo; el recorte lo controlamos nosotros
-        params = {"key": component_key.strip()}
-
-        try:
-            resp = self.session.get(
-                url,
-                auth=self._auth,
-                params=params,
-                timeout=self.cfg.timeout,
-            )
-
-            if resp.status_code in (401, 403):
-                raise SonarQubeAuthError(
-                    f"Auth error {resp.status_code} al acceder a código fuente raw."
-                )
-
-            resp.raise_for_status()
-
-            # Fuerza la decodificación correcta
-            resp.encoding = "utf-8"
-            text = resp.text
-            if not text:
-                return None
-
-            # Si no hay rango, devolvemos todo
-            if from_line is None and to_line is None:
-                return text
-
-            lines = text.splitlines()
-
-            # Convertimos a índices 0-based
-            start_idx = (from_line - 1) if from_line is not None else 0
-            end_idx = to_line if to_line is not None else len(lines)
-
-            # Acotamos defensivamente
-            start_idx = max(0, min(start_idx, len(lines)))
-            end_idx = max(start_idx, min(end_idx, len(lines)))
-
-            sliced = lines[start_idx:end_idx]
-
-            return "\n".join(sliced)
-
-        except (requests.Timeout, requests.ConnectionError) as e:
-            self.log.error(
-                "Fallo de red al obtener raw source de %s (%s-%s): %s",
-                component_key, from_line, to_line, e
-            )
-            return None
-        except requests.HTTPError as e:
-            self.log.error(
-                "HTTP error al obtener raw source de %s (%s-%s): %s",
-                component_key, from_line, to_line, e
-            )
-            return None
-
-# -------------------------
-    # Projects
+    # Projects (una sola definición)
     # -------------------------
     def iter_projects(
         self,
@@ -621,34 +380,15 @@ class SonarQubeClient:
         include_visibility: bool = False,
         additional_params: Optional[Dict[str, Any]] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        Itera todos los proyectos (por defecto qualifier TRK) usando /api/components/search.
-
-        Args:
-            qualifiers: normalmente "TRK" para projects.
-            include_visibility: si True, pide a la API que incluya 'visibility' (si tu versión lo soporta).
-            additional_params: filtros extra del endpoint (p.ej. 'q' para búsqueda, etc.)
-        """
         params: Dict[str, Any] = {"qualifiers": qualifiers}
-
-        # Algunas versiones soportan "visibility" en el payload sin param;
-        # otras aceptan "additionalFields" (depende de versión). Lo hacemos opt-in y no rompemos.
         if include_visibility:
-            # "additionalFields" es habitual en varios endpoints; si tu instancia no lo soporta,
-            # simplemente ignóralo (o captura el error si te interesa endurecer comportamiento).
             params["additionalFields"] = "visibility"
-
         if additional_params:
-            # Evita que el caller pise qualifiers sin querer.
             extra = dict(additional_params)
             extra.pop("qualifiers", None)
             params.update(extra)
 
-        yield from self._iter_paginated(
-            "/api/components/search",
-            items_key="components",
-            base_params=params,
-        )
+        yield from self._iter_paginated("/api/components/search", items_key="components", base_params=params)
 
     def list_projects(
         self,
@@ -658,46 +398,50 @@ class SonarQubeClient:
         additional_params: Optional[Dict[str, Any]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Devuelve una lista con todos los proyectos.
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError("limit debe ser un entero > 0.")
 
-        Seguridad:
-          - `limit` opcional para evitar consumir memoria/tiempo en instancias grandes.
-
-        Args:
-            qualifiers: normalmente "TRK".
-            include_visibility: ver iter_projects.
-            additional_params: ver iter_projects.
-            limit: si se indica, corta la lista a ese máximo de proyectos.
-        """
-        if limit is not None:
-            if not isinstance(limit, int) or limit <= 0:
-                raise ValueError("limit debe ser un entero > 0.")
-
-        projects: List[Dict[str, Any]] = []
+        out: List[Dict[str, Any]] = []
         for p in self.iter_projects(
             qualifiers=qualifiers,
             include_visibility=include_visibility,
             additional_params=additional_params,
         ):
-            projects.append(p)
-            if limit is not None and len(projects) >= limit:
+            out.append(p)
+            if limit is not None and len(out) >= limit:
                 break
-        return projects
+        return out
 
- # -------------------------
-    # Projects (normalización)
+    # -------------------------
+    # Settings / exclusions
+    # -------------------------
+    @staticmethod
+    def _extract_setting_value(data: Dict[str, Any], setting_key: str) -> str:
+        settings = data.get("settings") or []
+        if not isinstance(settings, list):
+            return ""
+        for s in settings:
+            if isinstance(s, dict) and s.get("key") == setting_key:
+                v = s.get("value")
+                return v if isinstance(v, str) else ("" if v is None else str(v))
+        return ""
+
+    def get_exclusions(self, project_key: str) -> str:
+        if not project_key or not project_key.strip():
+            raise ValueError("project_key no puede estar vacío.")
+
+        data = self._request_json(
+            "GET",
+            "/api/settings/values",
+            params={"component": project_key.strip(), "keys": "sonar.exclusions"},
+        )
+        return self._extract_setting_value(data, "sonar.exclusions")
+
+    # -------------------------
+    # Normalización (puro)
     # -------------------------
     @staticmethod
     def normalize_project(component: Dict[str, Any], *, keep_raw: bool = False) -> Project:
-        """
-        Normaliza un 'component' devuelto por /api/components/search en un Project.
-
-        Seguridad/robustez:
-          - Validación estricta de key/name (imprescindibles).
-          - Tolerancia a campos opcionales y variaciones por versión.
-          - keep_raw permite conservar el dict original si lo necesitas (audit/debug).
-        """
         if not isinstance(component, dict):
             raise TypeError("component debe ser un dict (payload de SonarQube).")
 
@@ -710,33 +454,24 @@ class SonarQubeClient:
             raise ValueError("Proyecto inválido: falta 'name' o no es válido.")
 
         qualifier = component.get("qualifier") or "TRK"
-
-        # Campos opcionales comunes (depende de versión/permisos)
         visibility = component.get("visibility")
-        if visibility is not None and not isinstance(visibility, str):
-            visibility = str(visibility)
-
         last_analysis_date = component.get("lastAnalysisDate")
-        if last_analysis_date is not None and not isinstance(last_analysis_date, str):
-            last_analysis_date = str(last_analysis_date)
-
         revision = component.get("revision")
-        if revision is not None and not isinstance(revision, str):
-            revision = str(revision)
-
-        # Algunas APIs/variantes pueden traer "project" además del key; lo guardamos si existe
         project_field = component.get("project")
-        if project_field is not None and not isinstance(project_field, str):
-            project_field = str(project_field)
+
+        def _to_str_or_none(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            return v if isinstance(v, str) else str(v)
 
         return Project(
             key=key.strip(),
             name=name.strip(),
-            qualifier=str(qualifier) if qualifier is not None else "TRK",
-            visibility=visibility,
-            last_analysis_date=last_analysis_date,
-            revision=revision,
-            project=project_field,
+            qualifier=_to_str_or_none(qualifier) or "TRK",
+            visibility=_to_str_or_none(visibility),
+            last_analysis_date=_to_str_or_none(last_analysis_date),
+            revision=_to_str_or_none(revision),
+            project=_to_str_or_none(project_field),
             raw=component if keep_raw else None,
         )
 
@@ -749,18 +484,6 @@ class SonarQubeClient:
         keep_raw: bool = False,
         strict: bool = False,
     ) -> Iterator[Project]:
-        """
-        Itera proyectos normalizados.
-
-        Args:
-            qualifiers: normalmente "TRK"
-            include_visibility: si True pide visibility (si tu versión lo soporta)
-            additional_params: params extra para /api/components/search
-            keep_raw: guarda el dict original dentro de Project.raw
-            strict:
-                - True: cualquier proyecto inválido lanza excepción (fail-fast).
-                - False: se ignoran proyectos inválidos y se loguea warning.
-        """
         for comp in self.iter_projects(
             qualifiers=qualifiers,
             include_visibility=include_visibility,
@@ -773,24 +496,63 @@ class SonarQubeClient:
                     raise
                 self.log.warning("Proyecto omitido por payload inválido: %s", e)
 
+    # -------------------------
+    # Rule
+    # -------------------------
+    def get_rule(self, rule_key: str) -> Dict[str, Any]:
+        if not rule_key or not rule_key.strip():
+            raise ValueError("rule_key no puede estar vacío.")
+        data = self._request_json("GET", "/api/rules/show", params={"key": rule_key.strip()})
+        rule = data.get("rule") or {}
+        return rule if isinstance(rule, dict) else {}
+
+    @staticmethod
+    def extract_cwe_from_rule(rule_payload: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(rule_payload, dict):
+            return None
+
+        tags = rule_payload.get("tags") or []
+        sys_tags = rule_payload.get("sysTags") or []
+
+        def _pick(tags_list: Any) -> Optional[str]:
+            if not isinstance(tags_list, list):
+                return None
+            for t in tags_list:
+                if not isinstance(t, str):
+                    continue
+                tl = t.lower().strip()
+                if tl.startswith("cwe-"):
+                    return "CWE-" + tl.split("cwe-", 1)[1].strip()
+            return None
+
+        return _pick(sys_tags) or _pick(tags)
+
+    def list_projects_normalized2(self, *, limit: int = 5, strict: bool = False, **kwargs):
+        out = []
+        for i, p in enumerate(self.iter_projects_normalized(strict=strict, **kwargs)):
+            out.append(p)
+            if len(out) >= limit:
+                break
+        return out
+
     def list_projects_normalized(
         self,
         *,
         qualifiers: str = "TRK",
         include_visibility: bool = False,
-        additional_params: Optional[Dict[str, Any]] = None,
+        additional_params: Optional[dict] = None,
         keep_raw: bool = False,
         strict: bool = False,
         limit: Optional[int] = None,
-    ) -> List[Project]:
+    ) -> List["Project"]:
         """
-        Devuelve todos los proyectos normalizados en una lista (con límite opcional).
+        Devuelve una lista de proyectos normalizados (con límite opcional).
+        Wrapper conveniente sobre iter_projects_normalized().
         """
-        if limit is not None:
-            if not isinstance(limit, int) or limit <= 0:
-                raise ValueError("limit debe ser un entero > 0.")
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise ValueError("limit debe ser un entero > 0.")
 
-        out: List[Project] = []
+        out: List["Project"] = []
         for p in self.iter_projects_normalized(
             qualifiers=qualifiers,
             include_visibility=include_visibility,
@@ -802,3 +564,158 @@ class SonarQubeClient:
             if limit is not None and len(out) >= limit:
                 break
         return out
+
+    def get_issue_code_evidence(
+        self,
+        issue: Dict[str, Any],
+        *,
+        context_lines: int = 10,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene evidencia de código para una issue usando /api/sources/show.
+
+        Requiere en `issue`:
+          - component (str)
+          - startLine (int) y endLine (int) o equivalente
+          - hasLocation (bool) opcional
+
+        Devuelve:
+          {
+            "component": "...",
+            "from": <int>,
+            "to": <int>,
+            "snippet": "  108 | ...\n"
+          }
+        """
+        component_key, start_line, end_line = self._extract_issue_location(issue)
+        if component_key is None or start_line is None or end_line is None:
+            return None
+
+        if context_lines < 0:
+            raise ValueError("context_lines debe ser >= 0.")
+
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+
+        from_line = max(1, start_line - int(context_lines))
+        to_line = end_line + int(context_lines)
+
+        data = self._request_json(
+            "GET",
+            "/api/sources/show",
+            params={"key": component_key, "from": from_line, "to": to_line},
+        )
+
+        snippet = self._build_sources_snippet(data)
+        if snippet is None:
+            return None
+
+        return {
+            "component": component_key,
+            "from": from_line,
+            "to": to_line,
+            "snippet": snippet,
+        }
+
+
+    @staticmethod
+    def _extract_issue_location(issue: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+        """
+        Rutina pura: extrae (component_key, start_line, end_line) de una issue.
+        Soporta distintos formatos:
+          - issue["startLine"]/["endLine"] (issue ya normalizada)
+          - issue["textRange"]["startLine"]/["endLine"] (payload típico de SonarQube)
+          - issue["line"] (solo una línea)
+        """
+        if not isinstance(issue, dict):
+            raise TypeError("issue debe ser un dict.")
+
+        component_key = issue.get("component")
+        if not isinstance(component_key, str) or not component_key.strip():
+            return None, None, None
+        component_key = component_key.strip()
+
+        # Si hasLocation está explícito y es False, salimos
+        has_location = issue.get("hasLocation", None)
+        if has_location is False:
+            return None, None, None
+
+        # 1) preferimos startLine/endLine directos (normalizado)
+        start_line = issue.get("startLine")
+        end_line = issue.get("endLine")
+
+        # 2) si no, intentamos textRange (payload estándar)
+        if start_line is None or end_line is None:
+            tr = issue.get("textRange") or {}
+            if isinstance(tr, dict):
+                start_line = start_line if start_line is not None else tr.get("startLine")
+                end_line = end_line if end_line is not None else tr.get("endLine")
+
+        # 3) si no, usamos issue["line"] como línea única
+        if start_line is None and end_line is None:
+            one = issue.get("line")
+            start_line = one
+            end_line = one
+
+        try:
+            start_i = int(start_line) if start_line is not None else None
+            end_i = int(end_line) if end_line is not None else None
+        except (TypeError, ValueError):
+            return None, None, None
+
+        if start_i is None or end_i is None:
+            return None, None, None
+        if start_i <= 0 or end_i <= 0:
+            return None, None, None
+
+        return component_key, start_i, end_i
+
+
+    @staticmethod
+    def _build_sources_snippet(data: Dict[str, Any]) -> Optional[str]:
+        """
+        Rutina pura: construye snippet a partir del JSON de /api/sources/show.
+
+        SonarQube puede devolver:
+          A) {"sources":[{"line":108,"code":"..."}, ...]}
+          B) {"sources":[[108,"..."], ...]}  (algunas implementaciones/serializaciones)
+        """
+        if not isinstance(data, dict):
+            return None
+
+        sources = data.get("sources") or []
+        if not isinstance(sources, list) or not sources:
+            return None
+
+        lines_out: List[str] = []
+
+        for row in sources:
+            ln = None
+            code = None
+
+            # Formato A: dict
+            if isinstance(row, dict):
+                ln = row.get("line")
+                code = row.get("code")
+
+            # Formato B: lista/tupla [line, code]
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                ln = row[0]
+                code = row[1]
+
+            if code is None:
+                continue
+
+            try:
+                ln_int = int(ln)
+            except (TypeError, ValueError):
+                continue
+
+            # code puede no ser str
+            code_str = code if isinstance(code, str) else str(code)
+            lines_out.append(f"{ln_int:>5} | {code_str}")
+
+        if not lines_out:
+            return None
+
+        return "\n".join(lines_out)

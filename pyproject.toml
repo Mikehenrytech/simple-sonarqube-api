@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simple-sonarqube-api"
-version = "0.1.4"
+version = "0.1.5"
 description = "Simple Python client for SonarQube Web API"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,7 +20,8 @@ dev = [
   "pytest>=8",
   "responses>=0.25",
   "ruff>=0.6",
-  "mypy>=1.11"
+  "mypy>=1.11",
+  "python-dotenv>=1.2.1",
 ]
 
 [tool.setuptools]
@@ -41,3 +42,9 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "build", "dist"]
+skips = ["B101"]  # opcional: ignora assert (útil en tests)
+confidence = "medium"
+severity = "medium"
